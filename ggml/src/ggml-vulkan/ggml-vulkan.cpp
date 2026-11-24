@@ -1963,6 +1963,12 @@ static bool ggml_vk_amd_large_tile_supported(const vk_device& device) {
     return major > 2 || (major == 2 && build >= 416);
 }
 
+// K-quants and IQ3_S use their own warptiles for the q8_1 mmq path
+static bool ggml_vk_mmq_is_k_quant(ggml_type t) {
+    return t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
+           t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ3_S;
+}
+
 void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     VK_LOG_DEBUG("ggml_vk_load_shaders(" << device->name << ")");
 
@@ -2166,6 +2172,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
 
+        if (device->vendor_id == VK_VENDOR_ID_INTEL && !device->coopmat_support && !device->uma) {
+            l_warptile_mmq_int = { 256, 128, 128, 32, 64, 32, 1, 2, 2, 1, mm_warp_8 };
+        }
+
         const bool use_cm1_int = device->coopmat_int_support &&
                                  (device->architecture == AMD_RDNA3 || device->architecture == AMD_RDNA4);
 
@@ -2199,9 +2209,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             // The q8_1 mmq path has its own (larger) shmem layout, check it separately.
             // K-quants and IQ3_S use the _int_k warptiles, others use _int.
             // cm1 splits k-tiles on the KSCALES==2 types and shares tiles between dense/id.
-            const bool is_k_quant = (t == GGML_TYPE_Q2_K || t == GGML_TYPE_Q3_K ||
-                                     t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ||
-                                     t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ3_S);
+            const bool is_k_quant = ggml_vk_mmq_is_k_quant(t);
             const bool cm1_k_tile = (t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q6_K ||
                                      t == GGML_TYPE_NVFP4);
 
@@ -3255,20 +3263,25 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             return 0;
         };
     } else {
-        device->matmul_tile_selector = [](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
-                                          const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
-            if (configs.size() <= 1) return 0;
-            for (uint32_t i = 0; i < configs.size(); ++i) {
-                if (configs[i].narrow_n_max != 0 && n <= configs[i].narrow_n_max) return i;
-            }
-            uint32_t last = (uint32_t)configs.size() - 1;
-            while (last > 0 && configs[last].narrow_n_max != 0) --last;
-            if (last == 0 || m <= 32 || n <= 32) return 0;
-            if (last == 1) return 1;
-            if (m <= 64 || n <= 64) return 1;
-            return last;
+        const auto make_selector = [](uint32_t medium_max_n) {
+            return [medium_max_n](uint32_t m, uint32_t n, uint32_t /*k*/, uint32_t /*shader_core_count*/,
+                                  const std::vector<vk_matmul_pipeline_pair>& configs) -> uint32_t {
+                if (configs.size() <= 1) return 0;
+                for (uint32_t i = 0; i < configs.size(); ++i) {
+                    if (configs[i].narrow_n_max != 0 && n <= configs[i].narrow_n_max) return i;
+                }
+                uint32_t last = (uint32_t)configs.size() - 1;
+                while (last > 0 && configs[last].narrow_n_max != 0) --last;
+                if (last == 0 || m <= 32 || n <= 32) return 0;
+                if (last == 1) return 1;
+                if (m <= 64 || n <= medium_max_n) return 1;
+                return last;
+            };
         };
-        device->matmul_id_tile_selector = device->matmul_tile_selector;
+        // Discrete Intel without coopmat: the large 128x128 tile of the dense matmul only pays off for large batches
+        const bool intel_dgpu_no_coopmat = device->vendor_id == VK_VENDOR_ID_INTEL && !device->coopmat_support && !device->uma;
+        device->matmul_tile_selector = make_selector(intel_dgpu_no_coopmat ? 319 : 64);
+        device->matmul_id_tile_selector = make_selector(64);
     }
 
     // mul mat vec
@@ -5542,6 +5555,10 @@ vk_device ggml_vk_get_device(size_t idx) {
 #endif
 
             device->mul_mat_l_int[i]    = device->mul_mat_l[i];
+            // Discrete Intel without coopmat: only the dense q8_1 mmq path of non-K-quant types gets the large tile
+            if (device->vendor_id == VK_VENDOR_ID_INTEL && !device->coopmat_support && !device->uma && !ggml_vk_mmq_is_k_quant((ggml_type) i)) {
+                device->mul_mat_l_int[i] = true;
+            }
             device->mul_mat_m_int[i]    = device->mul_mat_m[i];
             device->mul_mat_s_int[i]    = device->mul_mat_s[i];
             device->mul_mat_id_l_int[i] = device->mul_mat_id_l[i];
