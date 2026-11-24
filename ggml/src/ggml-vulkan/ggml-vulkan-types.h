@@ -383,7 +383,9 @@ struct vk_queue {
     bool transfer_only;
 };
 
-static constexpr uint32_t mul_mat_vec_max_cols = 8;
+// capacity of the per-column mul_mat_vec pipeline arrays, the limit in use is ggml_vk_mul_mat_vec_max_cols()
+static constexpr uint32_t mul_mat_vec_max_cols = 16;
+static constexpr uint32_t mul_mat_vec_default_max_cols = 8;
 
 static constexpr uint32_t p021_max_gqa_ratio = 8;
 
