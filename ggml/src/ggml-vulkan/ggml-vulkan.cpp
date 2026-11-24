@@ -2774,7 +2774,11 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // Intel coopmat1 uses a dedicated large-tile config for quant matmul_id.
         std::vector<vk_tile_config> tc_mmq_id = tc_mmq;
         if (cm1_pin) {
-            tc_mmq_id[2] = { { 512, 128, 128, 32, 32, 32, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, 128, 1 }, 32 };
+            // Xe2 (Battlemage): a 128x64 tile is faster than 128x128, tokens are split across experts
+            const bool xe2 = device->architecture == vk_device_architecture::INTEL_XE2;
+            const uint32_t id_bn = xe2 ? 64 : 128;
+            const uint32_t id_wn = xe2 ? 16 : 32;
+            tc_mmq_id[2] = { { 512, 128, id_bn, 32, 32, id_wn, 2, device->coopmat_m, device->coopmat_n, device->coopmat_k, 32 }, { 128, id_bn, 1 }, 32 };
         }
 
         auto cm1_create = [&](vk_matmul_pipeline_key key, const std::vector<vk_tile_config>& tc_base,
