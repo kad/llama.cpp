@@ -6678,6 +6678,23 @@ static uint32_t ggml_vk_guess_split_k(ggml_backend_vk_context * ctx, uint32_t m,
         }
     }
 
+    // Intel: tiles for n > 32 leave the GPU underfilled (the rule above needs a full tile column),
+    // aim for a number of workgroups per core that depends on the tile size.
+    // Without coopmat the gain is limited to n <= 64. Short k does not benefit from splitting.
+    const uint32_t intel_split_k_min_k = 2048;
+    if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL && ctx->device->shader_core_count != 0 && !narrow_n && n > 32 &&
+        (ctx->device->coopmat_support || n <= 64) && k >= intel_split_k_min_k) {
+        const uint32_t tiles = CEIL_DIV(m, pipeline->wg_denoms[0]) * CEIL_DIV(n, pipeline->wg_denoms[1]);
+        // empirical: small tiles need more resident workgroups per core to hide latency than large ones
+        const uint32_t workgroups_per_core_small_tile = 24;
+        const uint32_t workgroups_per_core_large_tile = 4;
+        const bool small_tile = pipeline->wg_denoms[0] * pipeline->wg_denoms[1] <= 64 * 64;
+        const uint32_t workgroups_per_core = small_tile ? workgroups_per_core_small_tile : workgroups_per_core_large_tile;
+        // round to nearest: a slight shortfall (e.g. 64 tiles for a target of 80) is not worth a split
+        const uint32_t target = workgroups_per_core * ctx->device->shader_core_count;
+        split_k = std::min(8u, std::max(1u, (target + tiles / 2) / tiles));
+    }
+
     // Each split starts on a 256-value boundary; keep the last split nonempty.
     while (split_k > 1 && ROUNDUP_POW2(CEIL_DIV(uint64_t(k), split_k), 256) * (split_k - 1) >= k) {
         --split_k;
