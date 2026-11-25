@@ -452,10 +452,11 @@ struct vk_fa_pipeline_state {
     uint32_t limit_occupancy_shmem;
     ggml_type k_type;
     ggml_type v_type;
+    uint32_t mat_bc;
 
     bool operator<(const vk_fa_pipeline_state &b) const {
-        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type) <
-               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type);
+        return std::tie(HSK, HSV, Br, Bc, D_split, row_split, shmem_staging, path, workgroup_size, subgroup_size, aligned, f32acc, flags, limit_occupancy_shmem, k_type, v_type, mat_bc) <
+               std::tie(b.HSK, b.HSV, b.Br, b.Bc, b.D_split, b.row_split, b.shmem_staging, b.path, b.workgroup_size, b.subgroup_size, b.aligned, b.f32acc, b.flags, b.limit_occupancy_shmem, b.k_type, b.v_type, b.mat_bc);
     }
 };
 
@@ -798,6 +799,8 @@ struct vk_device_struct {
     bool coopmat_m1_get_coordinate {};
     bool coopmat_support_16x16x16_f16acc {};
     bool coopmat_support_16x16x16_f32acc {};
+    bool coopmat_support_8x16x16_f16acc {};
+    bool coopmat_support_8x16x16_f32acc {};
     bool coopmat1_fa_support {};
     uint32_t coopmat_m;
     uint32_t coopmat_n;
@@ -1452,12 +1455,14 @@ struct vk_fa_tuning_params {
     bool flip;
     bool flip_direct;
     uint32_t limit_occupancy_shmem;
+    // M of the coopmat1 S^T product: 16, or 8 where only 8x16x16 is exposed
+    uint32_t mat_bc = 16;
 
     void print() const {
         std::cerr << "path=" << path << " workgroup_size=" << workgroup_size << " subgroup_size=" << subgroup_size <<
                      " block_rows=" << block_rows << " block_cols=" << block_cols << " d_split=" << d_split <<
                      " row_split=" << row_split << " shmem_staging=" << shmem_staging << " disable_subgroups=" << disable_subgroups <<
-                     " q_in_regs=" << q_in_regs << " flip=" << flip << " flip_direct=" << flip_direct << " limit_occupancy_shmem=" << limit_occupancy_shmem << std::endl;
+                     " q_in_regs=" << q_in_regs << " flip=" << flip << " flip_direct=" << flip_direct << " limit_occupancy_shmem=" << limit_occupancy_shmem << " mat_bc=" << mat_bc << std::endl;
     }
 };
 

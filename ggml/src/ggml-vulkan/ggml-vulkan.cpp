@@ -1291,6 +1291,17 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     return result;
 }
 
+// M of the coopmat1 flash attention matrix shape: 16, 8 for Intel (only 8x16x16 is exposed), 0 if unsupported
+static uint32_t ggml_vk_fa_coopmat1_m(const vk_device& device, bool f32acc) {
+    if (f32acc ? device->coopmat_support_16x16x16_f32acc : device->coopmat_support_16x16x16_f16acc) {
+        return 16;
+    }
+    if (device->vendor_id == VK_VENDOR_ID_INTEL && (f32acc ? device->coopmat_support_8x16x16_f32acc : device->coopmat_support_8x16x16_f16acc)) {
+        return 8;
+    }
+    return 0;
+}
+
 static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type k_type, ggml_type v_type, bool f32acc, uint32_t qk_ratio, bool allow_flip) {
     GGML_UNUSED(n_kv);
 
@@ -1300,7 +1311,9 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     const uint32_t D = hsk | hsv;
 
     const uint32_t coopmat_block_rows = 16;
-    const uint32_t coopmat_block_cols = 16;
+    // with M=8 the key block per subgroup shrinks to 8 columns
+    const uint32_t mat_bc = ggml_vk_fa_coopmat1_m(device, f32acc) == 8 ? 8 : 16;
+    const uint32_t coopmat_block_cols = mat_bc;
 
     const uint32_t num_subgroups = 4;
 
@@ -1310,7 +1323,11 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     result.block_rows = double_block_rows ? 2 * coopmat_block_rows : coopmat_block_rows;
     result.block_cols = coopmat_block_cols * num_subgroups;
     result.row_split = num_subgroups;
+    result.mat_bc = mat_bc;
     result.subgroup_size = device->subgroup_size;
+    if (mat_bc == 8 && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) {
+        result.subgroup_size = 16;
+    }
     result.workgroup_size = num_subgroups * result.subgroup_size;
 
     const uint32_t D_lsb = D ^ (D & (D-1));  // extract lowest set bit
@@ -1358,7 +1375,7 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat1(const vk_device& device
     }
 
     // non-flip shader handles at most two row tiles
-    GGML_ASSERT(result.flip || result.block_rows <= 2 * coopmat_block_rows);
+    GGML_ASSERT(result.flip || result.block_rows <= 2 * mat_bc);
 
     return result;
 }
@@ -1408,8 +1425,7 @@ vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, 
     }
 
     if (path == FA_COOPMAT1) {
-        bool shape_ok = (f32acc && device->coopmat_support_16x16x16_f32acc) ||
-                        (!f32acc && device->coopmat_support_16x16x16_f16acc);
+        bool shape_ok = ggml_vk_fa_coopmat1_m(device, f32acc) != 0;
         vk_fa_tuning_params params = get_fa_tuning_params_coopmat1(device, hsk, hsv, n_rows, n_kv, k_type, v_type, f32acc, qk_ratio, allow_flip);
         bool shmem_ok = ggml_vk_flash_attn_coopmat_shmem_support(device, params, hsk, hsv, f32acc, k_type, v_type);
         if (!shmem_ok && params.flip) {
@@ -1456,7 +1472,7 @@ vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_
 
     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
 
-    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type};
+    return vk_fa_pipeline_state{hsk, hsv, params.block_rows, params.block_cols, params.d_split, params.row_split, params.shmem_staging, params.path, params.workgroup_size, subgroup_size, aligned, f32acc, flags, params.limit_occupancy_shmem, k_type, v_type, params.mat_bc};
 }
 
 static uint32_t fa_block_bytes(ggml_type t) {
@@ -1484,6 +1500,7 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
         /*13 FaTypeV         */ static_cast<uint32_t>(state.v_type),
         /*14 FaBlockBytesK   */ fa_block_bytes(state.k_type),
         /*15 FaBlockBytesV   */ fa_block_bytes(state.v_type),
+        /*16 MatBc           */ state.mat_bc,
     };
 }
 
@@ -5399,6 +5416,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f32acc = true;
                         }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f32acc = true;
+                        }
                     } else if ((vk::ComponentTypeKHR)prop.CType == vk::ComponentTypeKHR::eFloat16 &&
                                (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eFloat16) {
                         // coopmat sizes not set yet
@@ -5413,6 +5433,9 @@ vk_device ggml_vk_get_device(size_t idx) {
                         }
                         if (prop.MSize == 16 && prop.NSize == 16 && prop.KSize == 16) {
                             device->coopmat_support_16x16x16_f16acc = true;
+                        }
+                        if (prop.MSize == 8 && prop.NSize == 16 && prop.KSize == 16) {
+                            device->coopmat_support_8x16x16_f16acc = true;
                         }
                     }
                 } else if ((vk::ComponentTypeKHR)prop.AType      == vk::ComponentTypeKHR::eSint8 &&
@@ -9013,9 +9036,8 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t Br = params.block_rows;
     const uint32_t Bc = params.block_cols;
 
-    const uint32_t MatBr = 16, MatBc = 16;
-
-    const uint32_t row_split = Bc / MatBc;
+    const uint32_t MatBr = 16;
+    const uint32_t row_split = params.row_split;
 
     const uint32_t hsk_pad = ROUNDUP_POW2(hsk, 16);
     const uint32_t hsv_pad = ROUNDUP_POW2(hsv, 16);
@@ -9023,7 +9045,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t acctype = f32acc ? 4 : 2;
     const uint32_t f16vec4 = 8;
 
-    const uint32_t tmpsh = (Bc / MatBc) * sizeof(float);
+    const uint32_t tmpsh = row_split * sizeof(float);
     // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally, so its shared table is always allocated.
     const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
 
@@ -9038,7 +9060,7 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     const uint32_t sfsh = Bc * sfshstride * acctype;
 
     const uint32_t kvshstride = (params.shmem_staging ? std::max(hsk_pad, hsv_pad) : MatBr) / 4 + 2;
-    const uint32_t vsh_stride = MatBc / 4 * row_split;
+    const uint32_t vsh_stride = MatBr / 4 * row_split;
     const uint32_t ksh = ((kvshstride >= vsh_stride) ? (Bc * kvshstride) : (Bc * vsh_stride)) * f16vec4;
 
     const uint32_t slope = Br * acctype;
